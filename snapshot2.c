@@ -5,8 +5,8 @@
  * 
  * https://people.cs.rutgers.edu/~pxk/417/notes/images/clocks-vector.png
  * 
- * Compilação: mpicc -o rvet rvet.c
- * Execução:   mpiexec -n 3 ./rvet
+ * Compilação: mpicc -o snapshot2 snapshot2.c
+ * Execução:   mpiexec -n 3 ./snapshot2
  */
  
 #include <stdio.h>
@@ -16,6 +16,7 @@
 #include <pthread.h>
 #include <stdbool.h>
 #include <semaphore.h>
+
 #define BufferSize 20 // Size of the buffer
 
 sem_t empty;
@@ -26,20 +27,19 @@ sem_t empty1;
 sem_t full1;
 pthread_mutex_t mutex1;
 
-/*
+
 sem_t snapempty;
 sem_t snapfull;
 pthread_mutex_t snapmutex;
-*/
+
+pthread_mutex_t clockmutex;
 
 int in1 = 0;
 int out1 = 0;
+int tamanho=0;
 
 int in2 = 0;
 int out2 = 0;
-
-//int ins = 0;
-//int outs = 0;
 
 typedef struct 
 {
@@ -55,13 +55,19 @@ int pid;
 Clock bufferin[BufferSize];
 Clock bufferout[BufferSize];
 
-//Clock buffersnap[BufferSize];
+Clock channel1;
+
+Clock channel2;
 
 Clock clock1;
 
 Clock marker;
 
-int markcounter;
+int snapativo=0;
+int markcounter=0;
+
+void snapshot();
+void comparaClocks(Clock *clockv,int p0, int p1, int p2 );
 
 void producer1(Clock c)
 {   
@@ -93,6 +99,7 @@ void producer2(Clock c)
         sem_wait(&empty1);
         pthread_mutex_lock(&mutex1);
         bufferout[in2] = item3;
+        tamanho++;
         in2 = (in2+1)%BufferSize;
         pthread_mutex_unlock(&mutex1);
         sem_post(&full1);
@@ -104,16 +111,17 @@ Clock consumer2()
         pthread_mutex_lock(&mutex1);
         Clock item4 = bufferout[out2];
         out2 = (out2+1)%BufferSize;
+        tamanho--;
         pthread_mutex_unlock(&mutex1);
         sem_post(&empty1);
         return item4;
     
 }
 
-void comparaClocks(Clock *clockv,int p0, int p1, int p2 );
-
 void Event(int pid, Clock *clockt){
+   pthread_mutex_lock(&clockmutex);
    clockt->p[pid]++;
+   pthread_mutex_unlock(&clockmutex);
 }
 
 void *Emissor (){
@@ -125,22 +133,41 @@ void *Emissor (){
 
 void *ReceptorSnap (){
    while(1){
-   
    Clock clock;
+   MPI_Status status;
+   
+   pthread_mutex_lock(&clockmutex);
    int antigo0 = clock1.p[0];
    int antigo1 = clock1.p[1];
    int antigo2 = clock1.p[2];
-   MPI_Recv(clock.p, 3, MPI_INT, MPI_ANY_SOURCE, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+   pthread_mutex_unlock(&clockmutex);
+   
+   MPI_Recv(clock.p, 3, MPI_INT, MPI_ANY_SOURCE, 0, MPI_COMM_WORLD, &status);
+   
    if(clock.p[0]==-1){
-        Clock item=clock1;
-        sem_wait(&snapempty);
-        pthread_mutex_lock(&snapmutex);
-        bufferout[ins] = item;
-        ins = (ins+1)%BufferSize;
-        pthread_mutex_unlock(&snapmutex);
-        sem_post(&snapfull);
-        printf("clock salvo de %d, é (%d, %d, %d)\n", pid, clock1.p[0], clock1.p[1], clock1.p[2]);
-   }else{
+       
+       if(pid!=0){
+          snapshot();
+       }else{
+       markcounter++;
+       if(markcounter==2){
+           snapativo=0;
+       }
+       }
+   }else if(snapativo==1&&markcounter<2){
+       if(status.MPI_SOURCE==1){
+           channel1=clock;
+           printf("channel P1->P0 : {%d, %d, %d}\n",channel1.p[0],channel1.p[1],channel1.p[2]);
+           comparaClocks(&clock,antigo0,antigo1,antigo2);
+           producer2(clock);
+       }else if (status.MPI_SOURCE==2){
+           channel2=clock;
+           printf("channel P2->P0 : {%d, %d, %d}\n",channel2.p[0],channel2.p[1],channel2.p[2]);
+           comparaClocks(&clock,antigo0,antigo1,antigo2);
+           producer2(clock);
+       }
+   }
+   else{
    comparaClocks(&clock,antigo0,antigo1,antigo2);
    producer2(clock);
    }
@@ -148,13 +175,33 @@ void *ReceptorSnap (){
 }
 
 void snapshot(){
-   marker.destination=1;
-   producer1(marker);
-   
-   marker.destination=2;
-   producer1(marker);
+pthread_mutex_lock(&clockmutex);
+Clock c = clock1;
+
+printf("SNAPSHOT: clock salvo de %d é (%d, %d, %d)\n", pid, c.p[0], c.p[1], c.p[2]);
+
+if(pid==0){
+    marker.destination=1;
+    producer1(marker);
     
+    marker.destination=2;
+    producer1(marker);
+        
 }
+if(pid==1){
+    printf("channel P0->P1 : vazio\n");
+    marker.destination=0;
+    producer1(marker);
+}
+if(pid==2){
+    printf("channel P0->P2 : vazio\n");
+    marker.destination=0;
+    producer1(marker); 
+}
+
+pthread_mutex_unlock(&clockmutex);
+}
+
 
 
 void comparaClocks(Clock *clockv,int p0, int p1, int p2 )
@@ -182,6 +229,9 @@ void process0(){
    marker.p[1]=(-1);
    marker.p[2]=(-1);
    
+   channel1.p[0]=(-1);
+   channel2.p[0]=(-1);
+   
     pthread_t pro,con;
     pthread_mutex_init(&mutex, NULL);
     sem_init(&empty,0,BufferSize);
@@ -195,6 +245,7 @@ void process0(){
     sem_init(&snapempty,0,BufferSize);
     sem_init(&snapfull,0,0);
     
+    pthread_mutex_init(&clockmutex, NULL);
     
     pthread_create(&pro, NULL, (void *)Emissor, NULL);
     
@@ -204,8 +255,6 @@ void process0(){
    printf("Process: %d, Clock: (%d, %d, %d)\n", 0, clock1.p[0], clock1.p[1], clock1.p[2]);
    
    Event(pid, &clock1);
-   snapshot();
-   printf("clock salvo de %d, é (%d, %d, %d)\n", pid, clock1.p[0], clock1.p[1], clock1.p[2]);
    
    printf("Process: %d, Clock: (%d, %d, %d)\n", 0, clock1.p[0], clock1.p[1], clock1.p[2]);
    
@@ -218,6 +267,16 @@ void process0(){
     
    clock1=consumer2();
    Event(pid, &clock1);
+   
+   printf("<SNAPSHOT INICIADO>\n");
+   snapativo=1;
+   snapshot();
+   
+   while(snapativo){
+       
+   }
+   printf("<SNAPSHOT FINALIZAO>\n");
+   
    
    printf("Process: %d, Clock: (%d, %d, %d)\n", 0, clock1.p[0], clock1.p[1], clock1.p[2]);
    
@@ -258,6 +317,8 @@ void process0(){
     pthread_mutex_destroy(&snapmutex);
     sem_destroy(&snapempty);
     sem_destroy(&snapfull); 
+    
+    pthread_mutex_destroy(&clockmutex);
 
 }
 void process1(){
@@ -282,6 +343,8 @@ void process1(){
     pthread_mutex_init(&snapmutex, NULL);
     sem_init(&snapempty,0,BufferSize);
     sem_init(&snapfull,0,0);
+    
+    pthread_mutex_init(&clockmutex, NULL);
         
     
     pthread_create(&pro, NULL, (void *)Emissor, NULL);
@@ -320,6 +383,8 @@ void process1(){
     pthread_mutex_destroy(&snapmutex);
     sem_destroy(&snapempty);
     sem_destroy(&snapfull); 
+    
+    pthread_mutex_destroy(&clockmutex);
 }
 
 // Representa o processo de rank 2
@@ -345,6 +410,8 @@ void process2(){
     pthread_mutex_init(&snapmutex, NULL);
     sem_init(&snapempty,0,BufferSize);
     sem_init(&snapfull,0,0);
+    
+    pthread_mutex_init(&clockmutex, NULL);
         
     
     pthread_create(&pro, NULL, (void *)Emissor, NULL);
@@ -383,6 +450,8 @@ void process2(){
     pthread_mutex_destroy(&snapmutex);
     sem_destroy(&snapempty);
     sem_destroy(&snapfull); 
+    
+    pthread_mutex_destroy(&clockmutex);
 }
 
 
